@@ -1,7 +1,7 @@
 # SDEdit_SD2
 
 <p align="center">
-<img src="https://github.com/ermongroup/SDEdit/blob/main/images/sde_animation.gif" width="500"/>
+<img src="https://github.com/ermongroup/SDEdit/blob/main/images/sde_animation.gif" width="320"/>
 </p>
 
 [**Project**](https://chenlin9.github.io/SDEdit/) | [**Paper**](https://arxiv.org/abs/2108.01073) | [**Colab**](https://colab.research.google.com/drive/1KkLS53PndXKQpPlS1iK-k1nRQYmlb4aO?usp=sharing)
