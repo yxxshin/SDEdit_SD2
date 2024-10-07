@@ -3,10 +3,36 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-import torchvision.utils as tvu
+from torchvision.utils import save_image
 
 from models.diffusion import Model
 from functions.process_data import *
+
+from omegaconf import OmegaConf 
+from ldm.util import instantiate_from_config
+from PIL import Image
+from torchvision import transforms
+import torch.nn.functional as F
+
+def load_model_from_config(config, ckpt, device): 
+    print(f"Loading model from {ckpt}")
+    pl_sd = torch.load(ckpt, map_location=device)
+    if "state_dict" in pl_sd:
+        sd = pl_sd["state_dict"]
+    else:
+        sd = pl_sd 
+
+    model = instantiate_from_config(config.model)
+    missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
+
+    if len(missing_keys) > 0:
+        print(f"Missing keys: {missing_keys}")
+    if len(unexpected_keys) > 0:
+        print(f"Unexpected keys: {unexpected_keys}")
+        
+    model.to(device).float() 
+    model.eval() 
+    return model 
 
 
 def get_beta_schedule(*, beta_start, beta_end, num_diffusion_timesteps):
@@ -21,33 +47,10 @@ def extract(a, t, x_shape):
     broadcastable with x_shape."""
     bs, = t.shape
     assert x_shape[0] == bs
-    out = torch.gather(torch.tensor(a, dtype=torch.float, device=t.device), 0, t.long())
+    out = torch.gather(torch.tensor(a, dtype=torch.float32, device=t.device), 0, t.long())
     assert out.shape == (bs,)
     out = out.reshape((bs,) + (1,) * (len(x_shape) - 1))
     return out
-
-
-def image_editing_denoising_step_flexible_mask(x, t, *,
-                                               model,
-                                               logvar,
-                                               betas):
-    """
-    Sample from p(x_{t-1} | x_t)
-    """
-    alphas = 1.0 - betas
-    alphas_cumprod = alphas.cumprod(dim=0)
-
-    model_output = model(x, t)
-    weighted_score = betas / torch.sqrt(1 - alphas_cumprod)
-    mean = extract(1 / torch.sqrt(alphas), t, x.shape) * (x - extract(weighted_score, t, x.shape) * model_output)
-
-    logvar = extract(logvar, t, x.shape)
-    noise = torch.randn_like(x)
-    mask = 1 - (t == 0).float()
-    mask = mask.reshape((x.shape[0],) + (1,) * (len(x.shape) - 1))
-    sample = mean + mask * torch.exp(0.5 * logvar) * noise
-    sample = sample.float()
-    return sample
 
 
 class Diffusion(object):
@@ -59,86 +62,121 @@ class Diffusion(object):
                 "cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.device = device
 
-        self.model_var_type = config.model.var_type
-        betas = get_beta_schedule(
-            beta_start=config.diffusion.beta_start,
-            beta_end=config.diffusion.beta_end,
-            num_diffusion_timesteps=config.diffusion.num_diffusion_timesteps
+        # Stable Diffusion config
+        config_path = "stable_diffusion/768-v-ema.yaml"
+        self.config_sd = OmegaConf.load(config_path)
+
+        self.num_timesteps = self.config_sd.model.params.timesteps
+        betas = self.get_beta_schedule(
+            beta_start=self.config_sd.model.params.linear_start,
+            beta_end=self.config_sd.model.params.linear_end, 
+            num_diffusion_timesteps=self.num_timesteps
         )
         self.betas = torch.from_numpy(betas).float().to(self.device)
-        self.num_timesteps = betas.shape[0]
-
-        alphas = 1.0 - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1.0, alphas_cumprod[:-1])
-        posterior_variance = betas * \
-            (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        if self.model_var_type == "fixedlarge":
-            self.logvar = np.log(np.append(posterior_variance[1], betas[1:]))
-
-        elif self.model_var_type == 'fixedsmall':
-            self.logvar = np.log(np.maximum(posterior_variance, 1e-20))
+    
+    def get_beta_schedule(self, beta_start, beta_end, num_diffusion_timesteps):
+        return np.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64)
 
     def image_editing_sample(self):
-        print("Loading model")
-        if self.config.data.dataset == "LSUN":
-            if self.config.data.category == "bedroom":
-                url = "https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/bedroom.ckpt"
-            elif self.config.data.category == "church_outdoor":
-                url = "https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/church_outdoor.ckpt"
-        elif self.config.data.dataset == "CelebA_HQ":
-            url = "https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/celeba_hq.ckpt"
-        else:
-            raise ValueError
+        print("Loading Stable Diffusion model") 
+        device = self.device 
 
-        model = Model(self.config)
-        ckpt = torch.hub.load_state_dict_from_url(url, map_location=self.device)
-        model.load_state_dict(ckpt)
-        model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        ## Assuming Stable Diffusion 2.0
+        config_path = "stable_diffusion/768-v-ema.yaml"
+        ckpt_path = "stable_diffusion/768-v-ema.ckpt"
+
+        config = OmegaConf.load(config_path) 
+        model = load_model_from_config(config, ckpt_path, device)
         print("Model loaded")
-        ckpt_id = 0
 
-        download_process_data(path="colab_demo")
+        image_folder = os.path.join(self.args.image_folder, self.args.name, "img")
+        mask_folder = os.path.join(self.args.image_folder, self.args.name, "mask")
+
+        img_files = sorted([f for f in os.listdir(image_folder) if f.endswith(".jpg")])
+        mask_files = sorted([f for f in os.listdir(mask_folder) if f.endswith(".png")])
+        
+        assert len(img_files) == len(mask_files)
+
         n = self.config.sampling.batch_size
         model.eval()
+        model.float()
         print("Start sampling")
-        with torch.no_grad():
-            name = self.args.npy_name
-            [mask, img] = torch.load("colab_demo/{}.pth".format(name))
 
-            mask = mask.to(self.config.device)
-            img = img.to(self.config.device)
-            img = img.unsqueeze(dim=0)
-            img = img.repeat(n, 1, 1, 1)
-            x0 = img
+        for img_file, mask_file in zip(img_files, mask_files):
+            img_path = os.path.join(image_folder, img_file)
+            mask_path = os.path.join(mask_folder, mask_file)
 
-            tvu.save_image(x0, os.path.join(self.args.image_folder, f'original_input.png'))
-            x0 = (x0 - 0.5) * 2.
+            print(f"Processing {img_file} and {mask_file}")
 
-            for it in range(self.args.sample_step):
-                e = torch.randn_like(x0)
-                total_noise_levels = self.args.t
-                a = (1 - self.betas).cumprod(dim=0)
-                x = x0 * a[total_noise_levels - 1].sqrt() + e * (1.0 - a[total_noise_levels - 1]).sqrt()
-                tvu.save_image((x + 1) * 0.5, os.path.join(self.args.image_folder, f'init_{ckpt_id}.png'))
+            img = Image.open(img_path).convert("RGB")
+            mask = Image.open(mask_path).convert("L")
 
-                with tqdm(total=total_noise_levels, desc="Iteration {}".format(it)) as progress_bar:
-                    for i in reversed(range(total_noise_levels)):
-                        t = (torch.ones(n) * i).to(self.device)
-                        x_ = image_editing_denoising_step_flexible_mask(x, t=t, model=model,
-                                                                        logvar=self.logvar,
-                                                                        betas=self.betas)
-                        x = x0 * a[i].sqrt() + e * (1.0 - a[i]).sqrt()
-                        x[:, (mask != 1.)] = x_[:, (mask != 1.)]
-                        # added intermediate step vis
-                        if (i - 99) % 100 == 0:
-                            tvu.save_image((x + 1) * 0.5, os.path.join(self.args.image_folder,
-                                                                       f'noise_t_{i}_{it}.png'))
-                        progress_bar.update(1)
+            def pad_to_multiple_of_64(image):
+                w, h = image.size 
+                new_w = (w // 64) * 64
+                if w % 64 != 0:
+                    new_w += 64
+                new_h = (h // 64) * 64 
+                if h % 64 != 0:
+                    new_h += 64 
+                pad_w = new_w - w 
+                pad_h = new_h - h 
+                padding = (0, 0, pad_w, pad_h) 
+                return transforms.functional.pad(image, padding, fill = 0)
+            
+            img = pad_to_multiple_of_64(img)
+            preprocess = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5])
+            ])
+            x0 = preprocess(img).unsqueeze(0).to(device).float()
 
-                x0[:, (mask != 1.)] = x[:, (mask != 1.)]
-                torch.save(x, os.path.join(self.args.image_folder,
-                                           f'samples_{it}.pth'))
-                tvu.save_image((x + 1) * 0.5, os.path.join(self.args.image_folder,
-                                                           f'samples_{it}.png'))
+            mask = pad_to_multiple_of_64(mask)
+            mask = transforms.ToTensor()(mask).unsqueeze(0).to(device).float()
+
+            # Encode image to latent space 
+            with torch.no_grad():
+                z = model.get_first_stage_encoding(model.encode_first_stage(x0))
+            
+            # Prepare mask in latent space 
+            downsampling_factor = 8 
+            mask_latent = F.interpolate(mask.float(), size=(z.shape[2], z.shape[3]), mode='nearest')
+
+            total_noise_levels = self.num_timesteps
+            start_step = int(self.num_timesteps * self.args.t / 1000)
+
+            a = (1 - self.betas).cumprod(dim=0)
+            e = torch.randn_like(z).float()
+            z_noisy = z * a[start_step].sqrt() + e * (1.0 - a[start_step]).sqrt()
+
+            with tqdm(total=start_step, desc="Denoising") as progress_bar:
+                for i in reversed(range(start_step)):
+                    t = torch.full((n,), i, device=device, dtype=torch.float32) 
+
+                    text_prompt = ["A park with dirt"] * n
+                    uc = model.get_learned_conditioning(text_prompt).float()
+                    cond = {"c_crossattn": [uc]}
+
+                    # noise_pred = model.apply_model(z_noisy.float(), t.float(), cond)
+                    z_noisy = model.p_sample(z_noisy, cond, t)
+
+                    # z_noisy = z * mask_latent + z_noisy * (1 - mask_latent)
+                    z_noisy = z * (1 - mask_latent) + z_noisy * mask_latent
+
+                    # if (i % 50) == 0 or i == 0: 
+                    #     x_decoded = model.decode_first_stage(z_noisy)
+                    #     x_output = (x_decoded + 1.0) / 2.0 
+                    #     save_image(x_output, os.path.join(self.args.exp, f'step_{i}.png'))
+
+                    progress_bar.update(1)
+
+            
+            x_decoded = model.decode_first_stage(z_noisy)
+            x_output = (x_decoded + 1.0) / 2.0 
+
+            id = img_file.split('.')[0]
+
+
+            save_image(x_output, os.path.join(self.args.exp, f'{id}.png'))
+
+        print("Processing completed for all images")

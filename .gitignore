@@ -12,6 +12,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+stable_diffusion/
+data*
+exp/
+
 # C extensions
 *.so
 

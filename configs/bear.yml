@@ -1,0 +1,21 @@
+data:
+    dataset: "GS"
+    category: "GS"
+    image_size: 768
+    channels: 3
+    logit_transform: false
+    uniform_dequantization: false
+    gaussian_dequantization: false
+    random_flip: true
+    rescaled: true
+    num_workers: 32
+
+model:
+    type: "stable_diffusion"
+
+diffusion:
+    pass
+
+sampling:
+    batch_size: 1
+    last_only: True

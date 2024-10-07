@@ -7,8 +7,6 @@ import sys
 import os
 import torch
 import numpy as np
-import torch.utils.tensorboard as tb
-import copy
 
 from runners.image_editing import Diffusion
 
@@ -16,15 +14,14 @@ from runners.image_editing import Diffusion
 def parse_args_and_config():
     parser = argparse.ArgumentParser(description=globals()['__doc__'])
     parser.add_argument('--config', type=str, required=True, help='Path to the config file')
+    parser.add_argument('--exp', type=str, required=True, help='Output image folder')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed')
-    parser.add_argument('--exp', type=str, default='exp', help='Path for saving running related data.')
     parser.add_argument('--comment', type=str, default='', help='A string for experiment comment')
     parser.add_argument('--verbose', type=str, default='info', help='Verbose level: info | debug | warning | critical')
     parser.add_argument('--sample', action='store_true', help='Whether to produce samples from the model')
-    parser.add_argument('-i', '--image_folder', type=str, default='images', help="The folder name of samples")
+    parser.add_argument('-i', '--image_folder', type=str, default='data', help="The folder name of images/masks")
     parser.add_argument('--ni', action='store_true', help="No interaction. Suitable for Slurm Job launcher")
-    parser.add_argument('--npy_name', type=str, required=True)
-    parser.add_argument('--sample_step', type=int, default=3, help='Total sampling steps')
+    parser.add_argument('--name', type=str, required=True)
     parser.add_argument('--t', type=int, default=400, help='Sampling noise scale')
     args = parser.parse_args()
 
@@ -44,10 +41,8 @@ def parse_args_and_config():
     logger.addHandler(handler1)
     logger.setLevel(level)
 
-    os.makedirs(os.path.join(args.exp, 'image_samples'), exist_ok=True)
-    args.image_folder = os.path.join(args.exp, 'image_samples', args.image_folder)
-    if not os.path.exists(args.image_folder):
-        os.makedirs(args.image_folder)
+    if not os.path.exists(args.exp):
+        os.makedirs(args.exp)
     else:
         overwrite = False
         if args.ni:
@@ -58,8 +53,8 @@ def parse_args_and_config():
                 overwrite = True
 
         if overwrite:
-            shutil.rmtree(args.image_folder)
-            os.makedirs(args.image_folder)
+            shutil.rmtree(args.exp)
+            os.makedirs(args.exp)
         else:
             print("Output image folder exists. Program halted.")
             sys.exit(0)
